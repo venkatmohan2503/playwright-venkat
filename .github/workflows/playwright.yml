@@ -1,0 +1,104 @@
+# ============================================================
+# playwright.yml - GitHub Actions pipeline
+# 1. Run all tests
+# 2. If tests fail -> auto-heal broken CSS selectors with the Claude API
+# 3. Re-run tests with the healed selectors
+# 4. Open a pull request with the healed page objects (for review)
+# 5. Upload the HTML report + heal report as build artifacts
+# Needs repo secret: ANTHROPIC_API_KEY
+# ============================================================
+
+name: Playwright Tests + Auto-Heal
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:            # "Run workflow" button in the Actions tab
+  # schedule:                   # Uncomment for a nightly run (06:00 UTC, Mon-Fri)
+  #   - cron: '0 6 * * 1-5'
+
+# Needed so the pipeline can push a branch and open a pull request
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install packages
+        run: npm ci
+
+      - name: Install Chromium browser
+        run: npx playwright install --with-deps chromium
+
+      # Step 1: run tests. continue-on-error lets the heal steps run after a failure
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: npm test
+
+      # Step 2: heal only when tests failed. Skipped on pull requests (no PR-on-PR)
+      - name: Auto-heal broken CSS selectors (Claude API)
+        id: heal
+        if: steps.tests.outcome == 'failure' && github.event_name != 'pull_request'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: npm run heal
+
+      # Step 3: re-run tests only if something was healed
+      - name: Re-run tests with healed selectors
+        id: retest
+        if: steps.heal.outputs.healed == 'true'
+        continue-on-error: true
+        run: npm test
+
+      # Add the re-run result to the pull request text
+      - name: Add re-run result to PR description
+        if: steps.heal.outputs.healed == 'true'
+        run: printf "\n**Tests after healing:** %s\n" "${{ steps.retest.outcome }}" >> heal-summary.md
+
+      # Step 4: open a pull request with ONLY the changed page objects
+      - name: Open pull request with healed selectors
+        if: steps.heal.outputs.healed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: autoheal/run-${{ github.run_id }}
+          add-paths: pageObjects/*.js
+          commit-message: 'fix(selectors): auto-heal broken CSS selectors'
+          title: 'Auto-heal: updated CSS selectors (run #${{ github.run_number }})'
+          body-path: heal-summary.md
+
+      # Step 5: keep the reports for 14 days
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+            heal-report.json
+            heal-data/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # The job is red if tests failed and healing did not make them pass
+      - name: Fail the job if tests are still failing
+        if: steps.tests.outcome == 'failure' && steps.retest.outcome != 'success'
+        run: |
+          echo "Tests failed and auto-heal did not fix them. Download the playwright-report artifact."
+          exit 1
